@@ -1,0 +1,20 @@
+# secrets
+.env
+wallet.json
+var/
+*.key
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# downloaded faucet bundle (re-fetch with: python -m hskfaucet.installer)
+hskfaucet/vendor/
+
+# local agent/session scratch files
+commit
+commit.out
+sing_agent
+sing_agent.out

@@ -1,0 +1,8 @@
+Flask==3.0.3
+eth-account==0.13.5
+eth-abi==5.2.0
+eth-typing==5.0.0
+eth-utils==5.1.0
+requests==2.32.3
+python-dotenv==1.0.1
+gunicorn==23.0.0
