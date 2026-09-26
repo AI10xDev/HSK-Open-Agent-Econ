@@ -9,17 +9,23 @@ caller can see exactly which condition failed.
 ``signature_format``       65-byte ``0x``-prefixed hex
 ``signature_recovery``     EIP-191 recovery succeeds
 ``signer_matches``         recovered address == the address in the message
-``chain``                  chainId is the HSKChain testnet chain (133)
+``chain``                  chainId is the configured HSKChain network
+``network``                networkName is the configured network
 ``domain``                 message domain == this service
 ``uri``                    message URI == the endpoint being unlocked
 ``statement``              user consented to the expected text
 ``address_allowed``        signer is on the allowlist (if one is configured)
-``onchain``                signer has a footprint on the testnet (opt-in)
+``onchain``                signer has a footprint on that chain (opt-in)
 ``issued_at``              not issued in the future (beyond clock skew)
 ``not_expired``            expiration time is still in the future
 ``nonce_issued``           nonce was handed out by this server
 ``nonce_unused``           nonce has not been spent before (replay defence)
 =========================  =============================================
+
+The chain/network conditions are read from :class:`VerifierConfig` rather than
+hardcoded, which is what lets the same service run against HSKChain mainnet
+(177) or testnet (133) without a signature issued for one being honoured on the
+other.
 
 Note on ordering: nonce is *consumed* last, and only when every other condition
 passed, so a malformed or mismatched submission never burns a nonce.
@@ -38,10 +44,10 @@ from typing import Any, Callable, Protocol
 
 from eth_utils import to_checksum_address
 
-from hskfaucet.network import HSK_TESTNET
-
 from .message import (
+    DEFAULT_CHAIN_ID,
     DEFAULT_DOMAIN,
+    DEFAULT_NETWORK_NAME,
     DEFAULT_STATEMENT,
     DEFAULT_URI,
     ConditionedMessage,
@@ -58,6 +64,7 @@ class Condition(str, Enum):
     SIGNATURE_RECOVERY = "signature_recovery"
     SIGNER_MATCHES = "signer_matches"
     CHAIN = "chain"
+    NETWORK = "network"
     DOMAIN = "domain"
     URI = "uri"
     STATEMENT = "statement"
@@ -219,7 +226,11 @@ class FileNonceStore(InMemoryNonceStore):
 class VerifierConfig:
     """What a valid signature must look like for this service."""
 
-    chain_id: int = HSK_TESTNET.chain_id
+    #: Chain the signature must be conditioned on (177 mainnet / 133 testnet).
+    chain_id: int = DEFAULT_CHAIN_ID
+    #: Human-readable network name the message must name. Kept alongside
+    #: ``chain_id`` so failures and the signed text both name the same network.
+    network_name: str = DEFAULT_NETWORK_NAME
     domain: str = DEFAULT_DOMAIN
     uri: str = DEFAULT_URI
     statement: str = DEFAULT_STATEMENT
@@ -228,8 +239,10 @@ class VerifierConfig:
     clock_skew: timedelta = timedelta(seconds=60)
     #: How long an issued-but-unused nonce stays acceptable.
     nonce_ttl: timedelta = timedelta(minutes=15)
-    #: Require the signer to have an on-chain footprint on the testnet (i.e. a
-    #: faucet-funded account). Off by default so a brand-new key still works.
+    #: Require the signer to have an on-chain footprint on the configured chain
+    #: (non-zero nonce or balance, or deployed code). Off by default so a
+    #: brand-new key still works. On testnet this is the "the faucet funded this
+    #: account" check; on mainnet it means "this account has actually been used".
     require_onchain_activity: bool = False
     #: Returns truthy if the address is known to the chain. Injected so verify()
     #: stays testable without a network.
@@ -237,6 +250,27 @@ class VerifierConfig:
     #: Treat a failing/absent probe as pass so an RPC outage cannot lock
     #: everyone out of an otherwise valid signature.
     onchain_failure_is_fatal: bool = False
+
+    @classmethod
+    def for_network(cls, network, **overrides) -> "VerifierConfig":
+        """Build a config pinned to ``network`` (chain id + name + statement).
+
+        The convenient, hard-to-get-wrong way to configure a deployment: one
+        argument sets all three network-dependent fields consistently. Explicit
+        ``overrides`` win, so a caller can still pin a different statement.
+        """
+        from hskfaucet.network import Network, get_network
+
+        net = network if isinstance(network, Network) else get_network(network)
+        from .message import statement_for
+
+        params: dict = {
+            "chain_id": net.chain_id,
+            "network_name": net.name,
+            "statement": statement_for(net),
+        }
+        params.update(overrides)
+        return cls(**params)
 
 
 class ConditionedMessageVerifier:
@@ -330,13 +364,23 @@ class ConditionedMessageVerifier:
             else f"signature recovers to {recovered}, message claims {message.address}",
         )
 
-        # --- conditioned on the HSKChain testnet ---------------------------
+        # --- conditioned on the configured HSKChain network ------------------
         add(
             Condition.CHAIN,
             message.chain_id == self.config.chain_id,
-            f"chainId {message.chain_id} is HSKChain Testnet"
+            f"chainId {message.chain_id} is {self.config.network_name}"
             if message.chain_id == self.config.chain_id
-            else f"chainId {message.chain_id} != expected {self.config.chain_id}",
+            else f"chainId {message.chain_id} != expected {self.config.chain_id} "
+            f"({self.config.network_name})",
+        )
+
+        add(
+            Condition.NETWORK,
+            message.network_name == self.config.network_name,
+            f"network {message.network_name!r} accepted"
+            if message.network_name == self.config.network_name
+            else f"network {message.network_name!r} != expected "
+            f"{self.config.network_name!r}",
         )
 
         add(
@@ -463,11 +507,13 @@ class ConditionedMessageVerifier:
         return self._result(True, checks, recovered, message, sig)
 
     def _check_onchain(self, add: Callable[..., bool], address: str) -> None:
-        """Optionally confirm the signer actually exists on the HSKChain testnet.
+        """Optionally confirm the signer actually exists on the target chain.
 
-        This is the step that ties the faucet to the auth flow: an account the
-        faucet has funded has a non-zero balance / nonce, whereas an address
-        that has never touched the testnet does not. It is opt-in, and a
+        This is the step that ties a funded account to the auth flow: on testnet
+        the faucet gives an address a non-zero balance, whereas an address that
+        has never touched the chain does not. On mainnet there is no faucet, so
+        the same check instead means "this account has a footprint" (it has sent
+        a transaction, holds a balance, or is a contract). It is opt-in, and a
         transport failure is non-fatal by default so an RPC outage cannot deny
         an otherwise valid signature.
         """
@@ -499,12 +545,17 @@ class ConditionedMessageVerifier:
         active = info if isinstance(info, bool) else bool(getattr(info, "active", False))
         detail = info.to_dict() if hasattr(info, "to_dict") else {"active": active}
         if active:
-            add(Condition.ONCHAIN, True, f"signer is present on the testnet: {detail}")
+            add(
+                Condition.ONCHAIN,
+                True,
+                f"signer is present on {self.config.network_name}: {detail}",
+            )
         else:
             add(
                 Condition.ONCHAIN,
                 False,
-                f"signer has no testnet activity (e.g. never funded by the faucet): {detail}",
+                f"signer has no activity on {self.config.network_name} "
+                f"(never funded or never transacted): {detail}",
             )
 
     def _result(

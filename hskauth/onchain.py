@@ -1,18 +1,20 @@
-"""Minimal JSON-RPC client for checking accounts on the HSKChain testnet.
+"""Minimal JSON-RPC client for checking accounts on an HSKChain network.
 
 Signing is off-chain (EIP-191), so the RPC is not needed to *verify* a
-signature. It is needed to answer the question "is this really a HSKChain
-testnet account?", which is what :meth:`TestnetProbe.assert_testnet` and
-:meth:`TestnetProbe.probe_address` are for:
+signature. It is needed to answer the question "is this really an HSKChain
+account?", which is what :meth:`ChainProbe.assert_expected_chain` and
+:meth:`ChainProbe.probe_address` are for:
 
-* :meth:`chain_id` -- confirms the endpoint really serves chain 133, so a
-  signature condition bound to the testnet cannot be satisfied against a
+* :meth:`chain_id` -- confirms the endpoint really serves the chain we expect, so
+  a signature condition bound to mainnet cannot be satisfied against a
   mis-pointed or malicious RPC.
 * :meth:`probe_address` -- reports an address' on-chain footprint (nonce,
-  balance, code). An account that has interacted with the testnet (i.e. one the
-  faucet has funded) looks different from one that has never been seen.
+  balance, code). An account that has actually been used looks different from one
+  that has never been seen.
 
-Only ``eth_*`` read methods are used; nothing here can spend funds.
+The probe is pointed at a :class:`~hskfaucet.network.Network`, so the same code
+serves HSKChain mainnet (chain 177) and testnet (chain 133). Only ``eth_*`` read
+methods are used; nothing here can spend funds.
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ from typing import Any
 import requests
 from eth_utils import to_checksum_address
 
-from hskfaucet.network import HSK_TESTNET, Network
+from hskfaucet.network import DEFAULT_NETWORK, Network
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +37,7 @@ class RpcError(RuntimeError):
 
 @dataclass(frozen=True)
 class AddressProbe:
-    """On-chain footprint of an address on the testnet."""
+    """On-chain footprint of an address on the target network."""
 
     address: str
     nonce: int
@@ -58,16 +60,16 @@ class AddressProbe:
             "balanceWei": str(self.balance_wei),
             "balanceHSK": f"{self.balance_hsk:.6f}",
             "isContract": self.is_contract,
-            "activeOnTestnet": self.active,
+            "activeOnChain": self.active,
         }
 
 
-class TestnetProbe:
-    """Read-only JSON-RPC probe for the HSKChain testnet."""
+class ChainProbe:
+    """Read-only JSON-RPC probe for an HSKChain network."""
 
     def __init__(
         self,
-        network: Network = HSK_TESTNET,
+        network: Network = DEFAULT_NETWORK,
         timeout: float = 15.0,
         session: requests.Session | None = None,
     ) -> None:
@@ -98,16 +100,21 @@ class TestnetProbe:
     def chain_id(self) -> int:
         return int(self.call("eth_chainId"), 16)
 
-    def block_number(self) -> int:
-        return int(self.call("eth_blockNumber"), 16)
+    def block_number(self) -> int | None:
+        """Current head, or ``None`` if the RPC cannot tell us."""
+        try:
+            return int(self.call("eth_blockNumber"), 16)
+        except RpcError as exc:
+            log.warning("block number unavailable from %s: %s", self.network.rpc_url, exc)
+            return None
 
-    def assert_testnet(self) -> int:
-        """Raise unless the endpoint is serving the expected testnet chain."""
+    def assert_expected_chain(self) -> int:
+        """Raise unless the endpoint is serving the network we expect."""
         actual = self.chain_id()
         if actual != self.network.chain_id:
             raise RpcError(
                 f"RPC {self.network.rpc_url} reports chainId {actual}, "
-                f"expected {self.network.chain_id}"
+                f"expected {self.network.chain_id} ({self.network.name})"
             )
         return actual
 
@@ -127,23 +134,28 @@ class TestnetProbe:
         """A snapshot for the ``/api/v1/network`` endpoint."""
         try:
             chain_id = self.chain_id()
-            block = self.block_number()
             reachable, error = True, None
         except RpcError as exc:
-            chain_id, block, reachable, error = None, None, False, str(exc)
+            chain_id, reachable, error = None, False, str(exc)
+        expected = self.network.chain_id
         return {
             "name": self.network.name,
             "chainId": chain_id,
-            "expectedChainId": self.network.chain_id,
-            "isTestnet": chain_id == self.network.chain_id,
+            "expectedChainId": expected,
+            "isExpectedNetwork": chain_id == expected,
+            "isTestnet": self.network.is_testnet,
             "rpcUrl": self.network.rpc_url,
             "explorerUrl": self.network.explorer_url,
             "nativeSymbol": self.network.native_symbol,
-            "blockNumber": block,
+            "blockNumber": self.block_number() if reachable else None,
             "faucetUrl": self.network.faucet_url,
             "reachable": reachable,
             "error": error,
         }
 
 
-__all__ = ["AddressProbe", "RpcError", "TestnetProbe"]
+#: Backwards-compatible alias. ``TestnetProbe`` is now just a name for
+#: ``ChainProbe`` pointed at whatever network is configured.
+TestnetProbe = ChainProbe
+
+__all__ = ["AddressProbe", "ChainProbe", "RpcError", "TestnetProbe"]

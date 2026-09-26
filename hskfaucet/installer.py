@@ -5,6 +5,10 @@ so "installing" it means: fetch the deployed bundle, verify and record what we
 got, then extract the API contract our Python client needs. Running this is
 idempotent and re-running it refreshes the pin file.
 
+This module always targets **testnet**, independently of ``HSK_NETWORK``: the
+official faucet has no mainnet deployment, so there is nothing to install for
+mainnet and no reason to let the selected network influence the download.
+
 Usage::
 
     python -m hskfaucet.installer            # download + install

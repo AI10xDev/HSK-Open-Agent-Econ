@@ -13,8 +13,12 @@ venv/
 # downloaded faucet bundle (re-fetch with: python -m hskfaucet.installer)
 hskfaucet/vendor/
 
-# local agent/session scratch files
+# local agent/session scratch files (prompt specs + session transcripts)
 commit
 commit.out
 sing_agent
 sing_agent.out
+mainnet
+mainnet.out
+mock_test
+mock_test.out

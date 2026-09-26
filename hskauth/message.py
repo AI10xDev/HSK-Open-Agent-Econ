@@ -1,13 +1,14 @@
 """The *conditioned message*: what a wallet is asked to sign.
 
-This is a strict, SIWE-inspired (EIP-4361) conditioned message pinned to
-HSKChain Testnet. Every field is a condition the verifier re-checks, so a
-signature is only accepted when the whole set holds:
+This is a strict, SIWE-inspired (EIP-4361) conditioned message pinned to an
+HSKChain network (mainnet `177` or testnet `133`). Every field is a condition the
+verifier re-checks, so a signature is only accepted when the whole set holds:
 
 ===================  =========================================================
 ``domain``           host + port the request arrived on
 ``uri``              path of the endpoint being unlocked
-``chainId``          must equal the HSKChain testnet chain id (133)
+``chainId``          must equal the configured network's chain id
+``networkName``      must equal the configured network's name
 ``address``          the account being authenticated
 ``statement``        fixed human-readable text the user consents to
 ``nonce``            server-issued, high-entropy, single use (replay defence)
@@ -17,7 +18,9 @@ signature is only accepted when the whole set holds:
 ===================  =========================================================
 
 The rendered text follows the EIP-4361 layout so MetaMask and other wallets
-show something readable.
+show something readable. The network name is a *field*, not baked into the
+template, so a message issued for mainnet never says "testnet" and the text can
+always be re-derived from the structured fields during verification.
 """
 
 from __future__ import annotations
@@ -28,17 +31,52 @@ from datetime import datetime, timedelta, timezone
 
 from eth_utils import to_checksum_address
 
+from hskfaucet.network import (
+    DEFAULT_CHAIN_ID,
+    DEFAULT_NETWORK,
+    Network,
+    get_network,
+)
+
 #: 32 hex chars (128 bits) of CSPRNG entropy, per EIP-4361.
 NONCE_BYTES = 16
 NONCE_ALPHABET = "0123456789abcdef"
 
-DEFAULT_STATEMENT = (
-    "Sign in to the HSKChain testnet data API. This proves you control this "
-    "HSKChain Testnet account and authorises one API session. It moves no funds."
-)
 DEFAULT_DOMAIN = "localhost:5000"
 DEFAULT_URI = "/api/v1/data"
 DEFAULT_EXPIRY_SECONDS = 300
+
+#: Used when a caller builds a message without naming a network.
+DEFAULT_NETWORK_NAME: str = DEFAULT_NETWORK.name
+
+_STATEMENT_TEMPLATE = (
+    "Sign in to the {network} data API. This proves you control this "
+    "{network} account and authorises one API session. It moves no funds."
+)
+
+
+def statement_for(network: Network | str | None = None) -> str:
+    """The default consent text for ``network``.
+
+    Phrased per-network on purpose: a wallet showing "HSKChain Testnet" on a
+    mainnet deployment is a real support and trust problem, and the statement is
+    itself a verified condition, so the wording has to come from one place.
+    """
+    name = network if isinstance(network, str) else (network or DEFAULT_NETWORK).name
+    return _STATEMENT_TEMPLATE.format(network=name)
+
+
+def _coerce_network(network: Network | str | None) -> Network | None:
+    """Normalise ``network`` to a :class:`Network`, or ``None`` for 'use default'."""
+    if network is None:
+        return None
+    if isinstance(network, Network):
+        return network
+    return get_network(network)
+
+
+#: Backwards-compatible alias for the default network's statement.
+DEFAULT_STATEMENT = statement_for()
 
 
 def generate_nonce() -> str:
@@ -78,13 +116,17 @@ class ConditionedMessage:
 
     domain: str = DEFAULT_DOMAIN
     uri: str = DEFAULT_URI
-    chain_id: int = 133
+    chain_id: int = DEFAULT_CHAIN_ID
     address: str = ""
     statement: str = DEFAULT_STATEMENT
     nonce: str = field(default_factory=generate_nonce)
     issued_at: datetime = field(default_factory=utcnow)
     expiration_time: datetime | None = None
     request_id: str = field(default_factory=lambda: secrets.token_urlsafe(12))
+    #: Which network the message is pinned to. Part of the rendered text, so it
+    #: must round-trip through to_dict()/from_dict() for the schema check to
+    #: hold. Optional for backwards compatibility with pre-network payloads.
+    network_name: str = DEFAULT_NETWORK_NAME
 
     def __post_init__(self) -> None:
         if self.chain_id is None:
@@ -108,8 +150,9 @@ class ConditionedMessage:
     def as_message(self) -> str:
         """Render the human-readable / wallet-displayed text (EIP-4361 style)."""
         address = self.address  # EIP-55 checksummed
+        network = self.network_name or DEFAULT_NETWORK_NAME
         return (
-            f"{self.domain} wants you to sign in with your HSKChain Testnet account:\n"
+            f"{self.domain} wants you to sign in with your {network} account:\n"
             f"{address}\n"
             f"\n"
             f"{self.statement}\n"
@@ -132,6 +175,7 @@ class ConditionedMessage:
             "chainId": self.chain_id,
             "address": self.address,
             "statement": self.statement,
+            "networkName": self.network_name,
             "nonce": self.nonce,
             "issuedAt": _iso(self.issued_at),
             "expirationTime": _iso(self.expiration_time),
@@ -164,6 +208,10 @@ class ConditionedMessage:
             chain_id=int(data["chainId"]),
             address=data["address"],
             statement=data["statement"],
+            # Tolerated to be absent: payloads minted before the network became a
+            # field. Absent -> the default network's name, which is what those
+            # payloads implied.
+            network_name=data.get("networkName") or DEFAULT_NETWORK_NAME,
             nonce=data["nonce"],
             issued_at=parse_iso(data["issuedAt"]),
             expiration_time=parse_iso(data["expirationTime"]),
@@ -176,13 +224,28 @@ def build_message(
     *,
     domain: str = DEFAULT_DOMAIN,
     uri: str = DEFAULT_URI,
-    chain_id: int = 133,
-    statement: str = DEFAULT_STATEMENT,
+    chain_id: int = DEFAULT_CHAIN_ID,
+    statement: str | None = None,
     nonce: str | None = None,
     expiry_seconds: int = DEFAULT_EXPIRY_SECONDS,
     request_id: str | None = None,
+    network: Network | str | None = None,
 ) -> ConditionedMessage:
-    """Issue a fresh conditioned message for ``address``."""
+    """Issue a fresh conditioned message for ``address``.
+
+    ``network`` (a :class:`~hskfaucet.network.Network` or its name) pins the
+    message to that chain: it sets both ``chainId`` and the network name rendered
+    in the text. It defaults to the configured network, so the common case never
+    has to think about chain ids. The statement defaults to the per-network
+    consent text.
+    """
+    net = _coerce_network(network)
+    net_name = net.name if net is not None else DEFAULT_NETWORK_NAME
+    if net is not None:
+        # An explicit network wins over the module default chain id, otherwise a
+        # caller asking for testnet would silently get mainnet's 177.
+        chain_id = net.chain_id
+
     issued = utcnow()
     kwargs: dict = {}
     if nonce is not None:
@@ -194,23 +257,25 @@ def build_message(
         uri=uri,
         chain_id=chain_id,
         address=address,
-        statement=statement,
+        statement=statement_for(net) if statement is None else statement,
         issued_at=issued,
         expiration_time=issued + timedelta(seconds=expiry_seconds),
+        network_name=net_name,
         **kwargs,
     )
 
 
 __all__ = [
-    "ConditionedMessage",
     "DEFAULT_CHAIN_ID",
     "DEFAULT_DOMAIN",
     "DEFAULT_EXPIRY_SECONDS",
+    "DEFAULT_NETWORK_NAME",
     "DEFAULT_STATEMENT",
     "DEFAULT_URI",
+    "ConditionedMessage",
+    "build_message",
     "generate_nonce",
     "parse_iso",
+    "statement_for",
     "utcnow",
 ]
-
-DEFAULT_CHAIN_ID = 133

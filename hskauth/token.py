@@ -35,7 +35,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from hskfaucet.network import HSK_TESTNET
+from hskfaucet.network import DEFAULT_CHAIN_ID
 
 TOKEN_PREFIX = "hsk1"
 DEFAULT_TOKEN_TTL = 900  # 15 minutes
@@ -148,7 +148,7 @@ class TokenIssuer:
         self,
         *,
         address: str,
-        chain_id: int = HSK_TESTNET.chain_id,
+        chain_id: int = DEFAULT_CHAIN_ID,
         nonce: str,
         request_id: str,
         signature: str,

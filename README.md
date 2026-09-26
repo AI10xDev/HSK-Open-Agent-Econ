@@ -1,18 +1,25 @@
-# HSKChain Testnet — Faucet + Signed-Message Gated API
+# HSKChain — Faucet + Signed-Message Gated API
 
-A small Python project that does four things against the **HSKChain testnet**
-(chain id `133`):
+A small Python project that does four things against an **HSKChain** network:
 
-1. **Downloads and installs the official HSK testnet faucet.**
-2. **Issues a conditioned message** pinned to that testnet and verifies the
-   wallet's signature on it.
+1. **Downloads and installs the official HSK testnet faucet.** *(testnet only)*
+2. **Issues a conditioned message** pinned to the selected network and verifies
+   the wallet's signature on it.
 3. **Gates execution on every condition holding** — a signature unlocks the
    downstream work if and only if all checks pass.
 4. **Serves a Flask API** whose `POST` data endpoint only returns data when the
    request carries the random token derived from that signed message.
 
-Everything runs against the live public testnet; no private infrastructure is
-needed.
+The same code deploys to either public network. One variable decides which:
+
+| `HSK_NETWORK` | Chain id | RPC                        | Explorer                      | Faucet |
+| ------------- | -------- | -------------------------- | ----------------------------- | ------ |
+| `mainnet` (default) | `177` | `https://mainnet.hsk.xyz` | `hashkey.blockscout.com`      | none   |
+| `testnet`             | `133` | `https://testnet.hsk.xyz` | `testnet-explorer.hsk.xyz`    | yes    |
+
+No private infrastructure is needed either way. Nothing in the codebase hardcodes
+a chain id: the message, the verifier condition, the RPC probe and the consent
+wording all read from the selected network.
 
 ---
 
@@ -25,10 +32,13 @@ python3 -m venv .venv
 cp .env.example .env
 echo "HSK_TOKEN_SECRET=$(python3 -c 'import secrets;print(secrets.token_urlsafe(48))')" >> .env
 
-# 1. download + install the faucet
-.venv/bin/python -m hskfaucet.installer
+# 0. pick the network (mainnet is the default; add HSK_NETWORK=testnet for testnet)
+echo "HSK_NETWORK=mainnet" >> .env
 
-# 2. create a testnet wallet
+# 1. download + install the faucet -- TESTNET ONLY, skip on mainnet
+HSK_NETWORK=testnet .venv/bin/python -m hskfaucet.installer
+
+# 2. create a local keypair for that network
 .venv/bin/python cli.py wallet --new
 
 # 3. run the API
@@ -42,8 +52,8 @@ Then, in another shell, drive the whole handshake:
 ```
 
 ```
-1. POST /api/v1/challenge  (address 0x745a...e8E)
-   nonce=b2328889976639d3a8cd63bc2540f9a6 chainId=133 expires=2026-09-26T03:43:45Z
+1. POST /api/v1/challenge  (HSKChain Mainnet, address 0x745a...e8E)
+   nonce=b2328889976639d3a8cd63bc2540f9a6 chainId=177 expires=2026-09-26T03:43:45Z
 2. sign the conditioned message (EIP-191 personal_sign)
    signature=0x9ef5e0f1ed7bfa7b00...870650581b
 3. POST /api/v1/verify
@@ -53,9 +63,55 @@ Then, in another shell, drive the whole handshake:
    -> HTTP 200
 ```
 
+The demo warns if the local keypair's network does not match the one the running
+service reports, which is the most common deployment mistake.
+
+---
+
+## Deploying to mainnet
+
+```bash
+HSK_NETWORK=mainnet \
+HSK_TOKEN_SECRET=<48+ random bytes> \
+HSK_DOMAIN=api.your-domain.tld \
+HSK_NONCE_STORE=/var/lib/hsk/nonces.json \
+HOST=0.0.0.0 gunicorn -w 1 -b 0.0.0.0:8000 app:app
+```
+
+What changes versus testnet:
+
+* **Chain id `177`.** Verified live: `eth_chainId` on `mainnet.hsk.xyz` returns
+  `0xb1`. The `chain` and `network` conditions reject anything signed for `133`.
+* **No faucet.** HSKChain mainnet has none, and `FaucetClient` raises rather than
+  run against a non-testnet network. The faucet tooling is inert on mainnet.
+* **`HSK_TOKEN_SECRET` is mandatory.** On mainnet the service refuses to start
+  without it, because a generated secret would invalidate every outstanding
+  session on each restart. Set `HSK_PRODUCTION=false` to opt out locally.
+* **`HSK_CHAIN_ID` must agree with `HSK_NETWORK`.** A mismatch is a startup error,
+  not a warning, so a stale `HSK_CHAIN_ID=133` cannot leave you verifying against
+  the wrong chain.
+* **Set `HSK_ALLOWED_ADDRESSES`.** Mainnet means real accounts; the default
+  "anyone with a valid signature" is rarely what you want in public.
+
+Check what you actually deployed:
+
+```bash
+curl -s localhost:8000/api/v1/network | python3 -m json.tool
+# {"name": "HSKChain Mainnet", "chainId": 177, "expectedChainId": 177,
+#  "isExpectedNetwork": true, "isTestnet": false, "blockNumber": 28024448, ...}
+```
+
+`isExpectedNetwork` is the one to look at: it is `true` only when the live RPC
+agrees with the network the service believes it is configured for.
+
 ---
 
 ## 1. The faucet
+
+> **Testnet only.** HSKChain mainnet has no faucet — there is nothing to install
+> and nothing to claim. `FaucetClient` raises rather than construct against a
+> non-testnet network, and the installer always targets testnet regardless of
+> `HSK_NETWORK`. A mainnet deployment skips this whole section.
 
 ### What it is
 
@@ -129,26 +185,27 @@ at https://faucet.hsk.xyz/faucet and pass the token as `recaptcha_token`
 `cli.py balance` then shows the on-chain result:
 
 ```json
-{ "nonce": 0, "balanceHSK": "0.000000", "isContract": false, "activeOnTestnet": false }
+{ "nonce": 0, "balanceHSK": "0.000000", "isContract": false, "activeOnChain": false }
 ```
 
 > **The faucet is not required for the auth flow.** Signing is EIP-191
 > `personal_sign`, which is entirely off-chain and needs no gas. Funding is only
-> needed if you want the account to be *active* on the testnet — which is what
-> the optional `HSK_REQUIRE_ONCHAIN` check looks for.
+> needed if you want the account to be *active* on the chain — which is what the
+> optional `HSK_REQUIRE_ONCHAIN` check looks for.
 
 ---
 
 ## 2 & 3. The conditioned message, and what gates on it
 
-The message is SIWE-inspired (EIP-4361) and pinned to the testnet
-(`hskauth/message.py`):
+The message is SIWE-inspired (EIP-4361) and pinned to the selected network
+(`hskauth/message.py`) — shown for testnet; a mainnet deployment renders
+`HSKChain Mainnet` and `Chain ID: 177` instead:
 
 ```
 localhost:5000 wants you to sign in with your HSKChain Testnet account:
 0x745a955AdA130f8556f1359fC3830ef77C638e8E
 
-Sign in to the HSKChain testnet data API. This proves you control this
+Sign in to the HSKChain Testnet data API. This proves you control this
 HSKChain Testnet account and authorises one API session. It moves no funds.
 
 URI: /api/v1/data
@@ -160,9 +217,14 @@ Expiration Time: 2026-09-26T03:43:45Z
 Request ID: f8mo2OKlEBtqTtOo
 ```
 
+The network name is a *field* on the message, not a string baked into the
+template, so a mainnet deployment can never show a wallet the word "testnet",
+and the text is always re-derivable from the structured fields during
+verification.
+
 `hskauth/verify.py` re-checks every condition. The gate is all-or-nothing — each
 one must hold, and every result is reported so you can see exactly what failed.
-Thirteen run by default; `onchain` is the opt-in fourteenth:
+Fourteen run by default; `onchain` is the opt-in fifteenth:
 
 | condition | what it proves |
 |---|---|
@@ -170,12 +232,13 @@ Thirteen run by default; `onchain` is the opt-in fourteenth:
 | `signature_format` | 65-byte `0x` hex |
 | `signature_recovery` | EIP-191 recovery succeeded |
 | `signer_matches` | recovered address == the address in the message |
-| `chain` | `chainId` is the HSKChain **testnet** (133) |
+| `chain` | `chainId` is the configured network (177 / 133) |
+| `network` | `networkName` is the configured network |
 | `domain` | message domain == this service |
 | `uri` | message URI == the endpoint being unlocked |
 | `statement` | user consented to the expected text |
 | `address_allowed` | signer is on the allowlist (if configured) |
-| `onchain` | signer has a footprint on the testnet *(opt-in)* |
+| `onchain` | signer has a footprint on that chain *(opt-in)* |
 | `issued_at` | not future-dated or stale |
 | `not_expired` | still inside the validity window |
 | `nonce_issued` | nonce was handed out by this server |
@@ -186,28 +249,32 @@ Two design points worth calling out:
 * **The nonce is consumed last, and only on success.** A malformed or mismatched
   submission never burns a nonce, so an attacker cannot lock a victim out by
   burning their nonce with garbage.
-* **`chain` is what makes this testnet-specific.** A valid signature over
-  `chainId: 1` (Ethereum mainnet) is cryptographically fine but is rejected
-  here — a signature is bound to exactly one chain's conditions.
+* **`chain` is what makes the deployment network-specific.** A valid signature
+  over `chainId: 1` (Ethereum mainnet) is cryptographically fine but is rejected
+  here, and so is a correctly signed HSKChain *testnet* message presented to a
+  *mainnet* service. A signature is bound to exactly one chain's conditions,
+  which is what makes this safe to point at either network.
 
 ### The on-chain check
 
 `hskauth/onchain.py` is a read-only JSON-RPC client (only `eth_*` reads, it
-cannot spend). It confirms the endpoint really serves chain 133 — so a
-signature condition bound to the testnet cannot be satisfied against a
+cannot spend). It confirms the endpoint really serves the configured chain — so
+a signature condition bound to mainnet cannot be satisfied against a
 mis-pointed or malicious RPC — and reports an address' on-chain footprint.
 
 ```bash
 $ curl -s localhost:5000/api/v1/network
-{"name":"HSKChain Testnet","chainId":133,"expectedChainId":133,"isTestnet":true,
- "blockNumber":33603633,"reachable":true, ...}
+{"name":"HSKChain Mainnet","chainId":177,"expectedChainId":177,
+ "isExpectedNetwork":true,"isTestnet":false,"blockNumber":28024448,
+ "reachable":true, ...}
 ```
 
 Set `HSK_REQUIRE_ONCHAIN=true` to additionally demand that the signer is an
-account the faucet has actually funded. It is **off by default** so a brand-new
-key still works, and an RPC outage is non-fatal by default so a flaky node
-cannot deny an otherwise valid signature (`HSK_ONCHAIN_FATAL=true` to change
-that).
+account with a real footprint on that chain (non-zero nonce or balance, or
+deployed code) — on testnet effectively "the faucet funded it", on mainnet "this
+account is not brand new". It is **off by default** so a brand-new key still
+works, and an RPC outage is non-fatal by default so a flaky node cannot deny an
+otherwise valid signature (`HSK_ONCHAIN_FATAL=true` to change that).
 
 ---
 
@@ -217,8 +284,8 @@ that).
 POST /api/v1/challenge   → issue a conditioned message + fresh nonce
 POST /api/v1/verify      → verify the signature; mint a token only if valid
 POST /api/v1/data        → the protected endpoint (Authorization: Bearer <token>)
-GET  /api/v1/network     → live testnet status
-GET  /api/v1/session     → list sessions
+GET  /api/v1/network     → live status of the configured network
+GET  /api/v1/session     → your own session (requires the bearer token)
 DELETE /api/v1/session   → revoke your own token (requires the bearer token)
 GET  /health, GET /
 ```
@@ -257,7 +324,7 @@ WWW-Authenticate: Bearer
 {"error":"missing_token",
  "message":"Send the token from POST /api/v1/data as 'Authorization: Bearer <token>'.",
  "howToGetOne":["POST /api/v1/challenge",
-                "sign the returned message with your HSKChain Testnet account",
+                "sign the returned message with your HSKChain Mainnet account",
                 "POST /api/v1/verify"]}
 ```
 
@@ -293,14 +360,18 @@ With a valid token — data returned:
 
 ```json
 {"granted":true,
- "reason":"signed conditioned message verified against HSKChain Testnet",
- "authorizedBy":{"address":"0x745a...e8E","chainId":133,
+ "reason":"signed conditioned message verified against HSKChain Mainnet",
+ "authorizedBy":{"address":"0x745a...e8E","chainId":177,
                  "sessionId":"aU4U2o37Df4HYD1pGhQwy3PCYmVwwIgr",
                  "signature":"6981d54fcb6d5fd9"},
- "data":{"dataset":"hsk-testnet-blocks","count":3,
-         "records":[{"id":"blk-1","height":33000001,"chainId":133, ...}]},
+ "network":{"name":"HSKChain Mainnet","chainId":177,"isTestnet":false},
+ "data":{"dataset":"hsk-mainnet-blocks","count":3,"head":28024448,
+         "records":[{"id":"blk-1","height":28024446,"chainId":177, ...}]},
  "echo":"hello"}
 ```
+
+`head` and the record heights are the real chain head when the RPC answers
+(cached for 15s, and never allowed to block a request for more than 3s).
 
 ### Verified behaviour
 
@@ -311,13 +382,18 @@ Every one of these was exercised against a running instance:
 | valid signature → token → data | `200` |
 | signature from a different key | `403` `failed: ["signer_matches"]`, no token |
 | valid signature for `chainId: 1` | `403` `failed: ["chain"]` |
+| valid **testnet** signature at the **mainnet** service | `403` `failed: ["chain", "network", ...]` |
+| valid signature at a service on the *other* network | `403`, no token |
 | replaying a good signature | `403` `failed: ["nonce_unused"]` |
 | `POST /api/v1/data` with no token | `401` `missing_token` |
 | token with three characters flipped | `401` `invalid_token: invalid token signature` |
 | token minted with a different server secret | `401` |
+| `GET /api/v1/session` without a token | `401` |
 | `DELETE /api/v1/session` without a token | `401` |
 | revoking another session's id | `403` `forbidden_session` |
 | revoking your own token, then reusing it | `401` `token revoked` |
+| faucet client pointed at mainnet | raises `FaucetError` |
+| reusing a mainnet keypair on testnet | `WalletError` |
 
 ---
 
@@ -327,44 +403,62 @@ Every one of these was exercised against a running instance:
 .venv/bin/python -m unittest discover -s tests -t . -v
 ```
 
-**58 tests, all passing.** They cover the faucet's HMAC canonicalisation and
-install integrity, every condition (each with a test proving it actually blocks),
-token forgery/tamper/expiry/revocation, the full HTTP handshake, and two tests
-against the **live** testnet RPC.
+**102 tests, all passing.** They cover the faucet's HMAC canonicalisation and
+install integrity, the network registry (mainnet/testnet params, lookup, and
+that the two never collide), every condition (each with a test proving it
+actually blocks), cross-network rejection in both directions, token
+forgery/tamper/expiry/revocation, the wallet's network binding, the deployment
+config rules (mandatory secret, chain-id mismatch), the full HTTP handshake, and
+tests against the **live** mainnet and testnet RPCs.
 
 ---
 
 ## Layout
 
 ```
-hskfaucet/          the faucet
-  network.py          HSKChain testnet parameters (chainId 133)
+hskfaucet/          networks + the testnet-only faucet
+  network.py          mainnet (177) + testnet (133) parameters, env resolution
   hmac_auth.py        HMAC-SHA256 request signing
-  client.py           drip() / query() with polling
+  client.py           drip() / query() with polling; refuses non-testnet
   installer.py        download + install + verify
   vendor/             installed bundle + install-manifest.json
 hskauth/             conditioned-message auth
-  message.py          the conditioned message (SIWE-style)
-  wallet.py           keypair + EIP-191 sign / recover
-  verify.py           the 13 conditions
+  message.py          the conditioned message (SIWE-style, network-derived)
+  wallet.py           keypair + EIP-191 sign / recover, bound to a network
+  verify.py           the 15 conditions
   token.py            the random signed-message token
-  onchain.py          read-only testnet JSON-RPC probe
+  onchain.py          read-only JSON-RPC probe
 app.py              the Flask API
 cli.py              faucet / wallet / sign / demo
-tests/test_flow.py  58 tests
+tests/test_flow.py  102 tests
 ```
 
 ---
 
 ## Security notes
 
-* `HSK_TOKEN_SECRET` is **required** for anything real. Without it a random
-  secret is generated at boot and every restart invalidates outstanding tokens —
-  fine for `flask run`, useless in production.
+* `HSK_TOKEN_SECRET` is **required** on mainnet and whenever `HSK_PRODUCTION=true`
+  — the service refuses to start without it. Without it a random secret is
+  generated at boot and every restart invalidates outstanding tokens, which is
+  fine for local testnet work and useless in production.
+* `HSK_CHAIN_ID` must match `HSK_NETWORK` or the service will not start. A stale
+  `HSK_CHAIN_ID=133` left over from a testnet setup is the failure this catches.
+* The faucet is **testnet-only by construction**: `FaucetClient` raises against a
+  non-testnet network, and mainnet carries no `faucet_url`. There is no code path
+  from this project that can request real HSK.
+* `wallet.json` holds a private key at mode `0600`. It is a throwaway key for
+  proving address control and must never hold value. It records the network it
+  was made for and refuses to load against a different one, so a testnet key
+  cannot start authorising mainnet sessions.
 * Without `HSK_NONCE_STORE`, nonces live in RAM: restarts lose them (fail-closed)
   and gunicorn **must** run a single worker. Set `HSK_NONCE_STORE=./var/nonces.json`
   for multiple workers.
-* Set `HSK_ALLOWED_ADDRESSES` to restrict which accounts may obtain tokens.
+* Set `HSK_ALLOWED_ADDRESSES` to restrict which accounts may obtain tokens —
+  strongly recommended on a public mainnet deployment.
+* `GET /api/v1/session` requires a bearer token and returns only your own
+  session. The instance-wide list stays hidden unless
+  `HSK_EXPOSE_SESSION_LIST=true`, since it contains other users' addresses.
 * `HSK_DOMAIN` is part of the signed conditions — changing it invalidates
   in-flight challenges, so don't treat it as a mutable setting.
-* `wallet.json` holds a private key at mode `0600`. It is **testnet only**.
+* There is no rate limiting on `/challenge` or `/verify`. Put a reverse proxy in
+  front of a public deployment.

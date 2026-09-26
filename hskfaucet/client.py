@@ -1,4 +1,4 @@
-"""Client for the HSKChain testnet faucet REST API.
+"""Client for the HSKChain **testnet** faucet REST API.
 
 Endpoints (discovered from the official faucet bundle, see ``installer.py``):
 
@@ -12,6 +12,13 @@ Endpoints (discovered from the official faucet bundle, see ``installer.py``):
 The faucet dispatches an on-chain transaction and returns a job id; the
 transaction is only visible once it has been mined, so :meth:`FaucetClient.drip`
 polls ``query`` exactly like the web UI does (20 retries, 2s apart).
+
+.. warning::
+   **There is no faucet on HSKChain mainnet.** The official faucet exists only on
+   testnet (chain 133); mainnet HSK is real money. :class:`FaucetClient`
+   therefore refuses to be constructed against a non-testnet network rather than
+   trusting the caller to have picked the right chain. See
+   :meth:`FaucetClient.__init__`.
 
 .. warning::
    ``drip`` requires a genuine reCAPTCHA v2 token, which by design can only be
@@ -98,7 +105,11 @@ def _validate_address(address: str) -> str:
 
 
 class FaucetClient:
-    """HMAC-authenticated client for the HSKChain faucet API."""
+    """HMAC-authenticated client for the HSKChain faucet API.
+
+    Refuses construction against a non-testnet network: the faucet is a
+    testnet-only service, and this class dispatches real on-chain transactions.
+    """
 
     def __init__(
         self,
@@ -108,6 +119,12 @@ class FaucetClient:
         timeout: float = 30.0,
         session: requests.Session | None = None,
     ) -> None:
+        if not network.is_testnet:
+            raise FaucetError(
+                f"refusing to run the faucet against {network.name} (chain "
+                f"{network.chain_id}): the HSK faucet is testnet-only and has no "
+                f"mainnet deployment. Set HSK_NETWORK=testnet to use it."
+            )
         self.api_url = api_url.rstrip("/")
         self.credentials = credentials or FaucetCredentials.from_env()
         self.network = network
